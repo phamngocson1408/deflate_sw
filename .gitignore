@@ -1,0 +1,9 @@
+/.vscode
+/data_set
+/deflate_out
+/dicts_out
+/huffman_out
+/inputs
+/lz77_out
+/stats_out
+/__pycache__
