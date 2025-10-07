@@ -5,16 +5,16 @@
 2_build_huffman_table.py (prefix-prepend fast table)
 
 MÔ TẢ TÍNH NĂNG
-- Sinh bảng mã Huffman canonical (LSB-first) cho 286 symbol DEFLATE (0..285), giới hạn độ dài mã tối đa 10 bit và đảm bảo ràng buộc Kraft.
+- Sinh bảng mã Huffman canonical (LSB-first) cho 286 symbol DEFLATE (0..285), giới hạn độ dài mã tối đa 9 bit và đảm bảo ràng buộc Kraft.
 - Tự động gán tần suất = 1 cho các symbol không xuất hiện trong input.
 - Xuất 3 file CSV trong thư mục huffman_out/:
   1) huffman_litlen_encode_table.csv
      - Cột: symbol, code_bits_lsb, code_length, extra_bit, base_length
   2) huffman_litlen_decode_table.csv
      - Cột: code_bits_lsb, symbol, code_length, extra_bit, base_length
-  3) huffman_litlen_fast_fulltable.csv (fast 10-bit, LSB-first)
+  3) huffman_litlen_fast_fulltable.csv (fast 9-bit, LSB-first)
      - Được xây dựng DỰA TRÊN decode table theo quy tắc:
-       code_bits = prefix_lsb(10 - L) + code_bits_lsb
+       code_bits = prefix_lsb(9 - L) + code_bits_lsb
        (Là phép prepend: L bit CUỐI của code_bits LUÔN là code_bits_lsb.)
      - Đủ 1024 hàng (2^10), sort tăng dần theo code_bits.
 
@@ -32,21 +32,21 @@ LƯU Ý
   và dừng với FileNotFoundError.
 
 Quy tắc fast table theo yêu cầu:
-    code_bits = prefix_lsb(10 - L) + code_bits_lsb
+    code_bits = prefix_lsb(9 - L) + code_bits_lsb
 """
 
 import os, csv
 import pandas as pd
 import numpy as np
 
-INPUT_CSV  = os.path.join("stats_out", "combined_freq.csv")
+INPUT_CSV = "/mnt/data/combined_freq.csv" if os.path.exists("/mnt/data/combined_freq.csv") else os.path.join("stats_out","combined_freq.csv")
 OUTPUT_DIR = "huffman_out"
 
 ENC_CSV = os.path.join(OUTPUT_DIR, "huffman_litlen_encode_table.csv")      # MSB-first
 DEC_CSV = os.path.join(OUTPUT_DIR, "huffman_litlen_decode_table.csv")      # MSB-first
-FAST_FULL_CSV = os.path.join(OUTPUT_DIR, "huffman_litlen_fast_fulltable.csv")  # key 10-bit MSB-first
+FAST_FULL_CSV = os.path.join(OUTPUT_DIR, "huffman_litlen_fast_fulltable.csv")  # key 9-bit MSB-first
 
-MAX_LEN = 10
+MAX_LEN = 9
 NUM_SYMBOLS = 286  # 0..285
 
 def _detect_symbol_and_freq_cols(df: pd.DataFrame):
@@ -107,32 +107,35 @@ def assign_code_lengths(freq_series: pd.Series, max_len: int = MAX_LEN) -> np.nd
     assert lengths.max() <= max_len
     return lengths
 
+
+
 def build_rows_encode_msb(lengths: np.ndarray):
-    """Canonical code assignment (MSB-first codewords)."""
-    max_len = int(lengths.max())
-    bl_count = {l: int(np.sum(lengths == l)) for l in range(1, max_len + 1)}
-
-    # Canonical first_code per length (MSB-first)
-    first_code = {}
-    code = 0
-    for l in range(1, max_len + 1):
-        code <<= 1
-        first_code[l] = code
-        code += bl_count.get(l, 0)
-
-    next_code = {l: first_code[l] for l in range(1, max_len + 1)}
+    """Canonical code assignment (MSB-first) using RFC 1951 derivation of next_code."""
+    max_len = int(lengths.max()) if lengths.size else 0
+    bl_count = {l: int(np.sum(lengths == l)) for l in range(0, max_len + 1)}
+    bl_count.setdefault(0, 0)
+    next_code = {}
+    next_code[0] = 0
+    if max_len >= 1:
+        next_code[1] = 0
+    for bits in range(2, max_len + 1):
+        prev = next_code.get(bits - 1, 0) + bl_count.get(bits - 1, 0)
+        next_code[bits] = prev << 1
 
     pairs = sorted([(int(lengths[s]), s) for s in range(NUM_SYMBOLS)])
     rows = []
     for L, s in pairs:
         if L <= 0:
             continue
-        msb_code = next_code[L]; next_code[L] += 1
-        bits_msb = format(msb_code, "b").zfill(L)  # MSB-first string
+        code_val = next_code[L]
+        next_code[L] = code_val + 1
+        bits_msb = format(code_val, "b").zfill(L)
         eb, bl = deflate_length_meta(s)
         rows.append({"symbol": s, "code_bits_msb": bits_msb, "code_length": L, "extra_bit": eb, "base_length": bl})
     rows.sort(key=lambda r: r["symbol"])
     return rows
+
+
 
 def write_encode_csv(rows):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -159,8 +162,8 @@ def write_decode_csv(dec_rows):
         writer.writeheader()
         writer.writerows(dec_rows)
 
-def build_fast_full_msb(dec_rows, max_len=10):
-    """Xây FAST table 10-bit **MSB-first** bằng cách left-pad code và enumerate suffix."""
+def build_fast_full_msb(dec_rows, max_len=9):
+    """Xây FAST table 9-bit **MSB-first** bằng cách left-pad code và enumerate suffix."""
     out = []
     for r in dec_rows:
         L = int(r["code_length"])

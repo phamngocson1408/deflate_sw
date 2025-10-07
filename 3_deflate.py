@@ -1,4 +1,20 @@
 
+import configparser
+
+def load_config(path: str):
+    """Load INI config if exists. Expect [paths] with input_file, encode_table, outdir."""
+    cfgp = Path(path)
+    if not cfgp.exists():
+        return None
+    cfg = configparser.ConfigParser()
+    cfg.read(cfgp.as_posix(), encoding='utf-8')
+    return {
+        'input_file':  cfg.get('paths', 'input_file', fallback=''),
+        'encode_table': cfg.get('paths', 'encode_table', fallback='huffman_out/huffman_litlen_encode_table.csv'),
+        'outdir': cfg.get('paths', 'outdir', fallback='deflate_out'),
+    }
+
+
 # -*- coding: utf-8 -*-
 """
 3_deflate_csvbits_msb (1).py — LZ77 + Huffman (MSB-first via CSV code_bits)
@@ -316,13 +332,82 @@ def cli_decompress(args):
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     (outdir/"decompressed.lz").write_bytes(lz_stream)
     print("[decompress] Wrote ->", (outdir/'decompressed.lz').as_posix(), f"(tokens={len(tokens)})")
+
+def _default_config_path():
+    """Return best-guess path to config.ini without requiring --config.
+    Search order:
+      1) CWD/config.ini
+      2) Script directory/config.ini
+    """
+    try:
+        # 1) CWD
+        cwd_cfg = Path.cwd() / "config.ini"
+        if cwd_cfg.exists():
+            return cwd_cfg.as_posix()
+    except Exception:
+        pass
+    # 2) Script directory
+    try:
+        here = Path(__file__).resolve().parent / "config.ini"
+        if here.exists():
+            return here.as_posix()
+    except Exception:
+        pass
+    # Fallback default name in CWD even if missing (load_config will return None)
+    return "config.ini"
+
+
+def apply_config_to_args(args):
+    """Merge config into argparse Namespace. CLI values override config."""
+    cfg_path = getattr(args, 'config', None) or _default_config_path()
+    cfg = load_config(cfg_path)
+    # Defaults
+    enc = getattr(args, 'encode_table', None) or (cfg['encode_table'] if cfg else "huffman_out/huffman_litlen_encode_table.csv")
+    outd = getattr(args, 'outdir', None) or (cfg['outdir'] if cfg else "deflate_out")
+    # Determine input
+    inp = getattr(args, 'inp', None)
+    if not inp:
+        if cfg and cfg['input_file']:
+            inp = cfg['input_file']
+    # Fallbacks honoring original defaults if still None
+    if not inp:
+        # Keep previous parser defaults if any
+        inp = getattr(args, 'inp', None)
+    # Write back
+    setattr(args, 'encode_table', enc)
+    setattr(args, 'outdir', outd)
+    if inp:
+        setattr(args, 'inp', inp)
+    return args
+
 def cli_full_pipeline():
+    # Try config.ini first
+    cfg = load_config(_default_config_path())
+    if cfg:
+        enc_tbl_path = Path(cfg['encode_table'] or "huffman_out/huffman_litlen_encode_table.csv")
+        if not enc_tbl_path.exists():
+            print("[error] Không tìm thấy encode-table MSB trong", enc_tbl_path.as_posix())
+            print("=> Hãy chạy: python 2_build_huffman_table_msb.py"); sys.exit(1)
+        inp_file = cfg['input_file']
+        if not inp_file:
+            raise FileNotFoundError("config.ini thiếu 'input_file' trong [paths]")
+        raw_path = Path(inp_file)
+        if not raw_path.exists():
+            raise FileNotFoundError(f"Không thấy '{raw_path.as_posix()}'")
+        outdir = cfg['outdir'] or "deflate_out"
+        from types import SimpleNamespace
+        args_c = SimpleNamespace(inp=raw_path.as_posix(), encode_table=enc_tbl_path.as_posix(), outdir=outdir)
+        cli_compress(args_c)
+        args_d = SimpleNamespace(inp=f"{outdir}/compressed.hlz", encode_table=enc_tbl_path.as_posix(), outdir=outdir)
+        cli_decompress(args_d)
+        return
+    # Fallback to legacy behavior if no config.ini
     enc_tbl_path = Path("huffman_out/huffman_litlen_encode_table.csv")
     if not enc_tbl_path.exists():
         print("[error] Không tìm thấy encode-table MSB trong huffman_out/.")
         print("=> Hãy chạy: python 2_build_huffman_table_msb.py"); sys.exit(1)
     from types import SimpleNamespace
-    raw_default = "inputs"
+    raw_default = "data_set"
     rp = Path(raw_default)
     if rp.is_dir():
         files = [f for f in sorted(rp.iterdir()) if f.is_file() and not f.name.startswith('.')]
@@ -355,6 +440,7 @@ def cli_full_pipeline():
 # ===================== CLI parser =====================
 def build_parser():
     ap = argparse.ArgumentParser(description="3_deflate_csvbits_msb — LZ77 + Huffman MSB-first (CSV), token-only emit, preview, summary.")
+    ap.add_argument("--config\", default=None, help=\"Tùy chọn: chỉ định file INI (mặc định: tự tìm config.ini)")
     sub = ap.add_subparsers(dest="cmd")
     p_c = sub.add_parser("compress", help="Nén: raw -> LZ77 -> Huffman (.hlz, distance fixed MSB)")
     p_c.add_argument("--in", dest="inp", default="inputs")
@@ -368,5 +454,9 @@ def build_parser():
 def main():
     ap = build_parser(); argv = sys.argv[1:]
     if not argv: cli_full_pipeline(); return
-    args = ap.parse_args(argv); args.func(args)
+    args = ap.parse_args(argv)
+    args = apply_config_to_args(args)
+    args.func(args)
 if __name__=="__main__": main()
+
+
