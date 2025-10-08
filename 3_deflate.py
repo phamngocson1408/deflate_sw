@@ -243,31 +243,60 @@ def _emit_tokens_only(outdir: Path, comp: bytes, stem: str = "compressed_tokens"
     with (outdir / f"{stem}.binhex").open("w", encoding="utf-8") as fbin:
         for b in token_bytes: fbin.write(f"{b:08b}\n")
     print(f"[tokens-only] wrote -> {(outdir / (stem + '.bin')).as_posix()} (size={len(token_bytes)} bytes)")
+
 def _emit_tokenbits_512_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tokenbits_512"):
     if comp[:4] != b"HLZ1": raise ValueError("Bad magic: HLZ1")
     dec_trie = LitLenDecodeTrie_MSB(enc_csv)
     bits = bytes_to_bits_msb(comp[5:]); it = iter(bits)
+
     n_tok = bits_to_u32_msb(''.join(next(it) for _ in range(32)))
     total = 0; used_bits_all = []; taken = 0
     while taken < n_tok:
         sym, base_len, extra_bits, used, used_bits = dec_trie.decode_symbol(it)
         used_bits_all.append(used_bits); total += len(used_bits)
+
         if 257 <= sym <= 285:
-            if extra_bits > 0: eb = ''.join(next(it) for _ in range(extra_bits)); used_bits_all.append(eb); total += len(eb)
-            dcode = ''.join(next(it) for _ in range(5)); used_bits_all.append(dcode); total += 5
+            if extra_bits > 0:
+                eb = ''.join(next(it) for _ in range(extra_bits))
+                used_bits_all.append(eb); total += len(eb)
+            dcode = ''.join(next(it) for _ in range(5))
+            used_bits_all.append(dcode); total += 5
             base, deb = DIST_TABLE[int(dcode, 2)]
-            if deb > 0: dexb = ''.join(next(it) for _ in range(deb)); used_bits_all.append(dexb); total += len(dexb)
-        if total > 512: break
+            if deb > 0:
+                dexb = ''.join(next(it) for _ in range(deb))
+                used_bits_all.append(dexb); total += len(dexb)
+
+        # Dừng khi đã vượt hoặc chạm 512 bit
+        if total >= 512: 
+            taken += 1  # token hiện tại đã được lấy vào
+            break
+
         taken += 1
-        if total == 512: break
+
+    # Ghép bit đã thu
     payload_bits_raw = ''.join(used_bits_all)
-    # Pad the tail with zeros to reach exactly 512 bits
-    payload_bits = (payload_bits_raw + '0'*512)[:512]
+
+    # Số bit thực sự có ý nghĩa trong file đầu ra (bị cắt nếu >512, hoặc được pad nếu <512)
+    meaningful_bits = min(len(payload_bits_raw), 512)
+
+    # Pad đuôi bằng '0' cho đủ 512 bit
+    payload_bits = (payload_bits_raw + '0' * 512)[:512]
+
     outdir.mkdir(parents=True, exist_ok=True)
     bits_path = outdir / f"{stem}.bits"
     with bits_path.open("w", encoding="utf-8") as fbits:
         fbits.write(payload_bits)
-    print(f"[tokenbits-512] wrote -> {bits_path.as_posix()} (zero-padded to 512 bits, tokens={taken})")
+
+    # Ghi thêm file .nbits chứa số bit có ý nghĩa
+    nbits_path = outdir / f"{stem}.nbits"
+    with nbits_path.open("w", encoding="utf-8") as fmeta:
+        fmeta.write(str(meaningful_bits) + "\n")
+
+    # In ra màn hình
+    print(
+        f"[tokenbits-512] wrote -> {bits_path.as_posix()} "
+        f"(meaningful_bits={meaningful_bits}, padded={512 - meaningful_bits}, tokens={taken})"
+    )
 
 # ===================== Stats & summary =====================
 def _print_stats(raw_bytes: int, lz_bytes: int, hlz_bytes: int, prefix="[stats]"):
