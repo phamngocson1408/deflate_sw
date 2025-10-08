@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 
 SCRIPTS = [
-    ("Dictionary Trainer", "1_dict_trainer_with_ini.py"),
+    ("Dictionary Trainer", "1_dict_trainer_wo_zstd.py"),
     ("Build Huffman Table", "2_build_huffman_table.py"),
     ("Deflate (compress/decompress)", "3_deflate.py"),
 ]
