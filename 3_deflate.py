@@ -233,16 +233,150 @@ def preview_hlz_codebits_msb(label: str, comp: bytes, enc_csv: Path, n: int = 20
         print(f"{i:02d}: {bstr}  — {desc}")
 
 # ===================== Tokens-only / Tokenbits-512 =====================
-def _emit_tokens_only(outdir: Path, comp: bytes, stem: str = "compressed_tokens"):
-    if comp[:4] != b"HLZ1": raise ValueError("Bad magic: HLZ1")
-    token_bytes = comp[9:]
+def _emit_tokens_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tokens_chunked"):
+    """
+    Xuất stream dạng chunk 512 bit:
+      - Chunk thường: 5b header = offset(0..31), + 507b payload (không cắt token).
+      - Chunk cuối:   5b header = 11111 (sentinel=32), + 9b used_bits, + 498b payload.
+    Ghi ra:
+      - <stem>.bin  : nhị phân nối tiếp các chunk
+      - <stem>.mem  : mỗi dòng 512 ký tự '0'/'1' (dùng cho $readmemb)
+      - <stem>.chunks.txt: log kiểm tra
+    """
+    if comp[:4] != b"HLZ1":
+        raise ValueError("Bad magic: HLZ1")
+
     outdir.mkdir(parents=True, exist_ok=True)
-    (outdir / f"{stem}.bin").write_bytes(token_bytes)
-    with (outdir / f"{stem}.hex").open("w", encoding="utf-8") as fhex:
-        for b in token_bytes: fhex.write(f"{b:02X}\n")
-    with (outdir / f"{stem}.binhex").open("w", encoding="utf-8") as fbin:
-        for b in token_bytes: fbin.write(f"{b:08b}\n")
-    print(f"[tokens-only] wrote -> {(outdir / (stem + '.bin')).as_posix()} (size={len(token_bytes)} bytes)")
+    dec_trie = LitLenDecodeTrie_MSB(Path(enc_csv))
+
+    # Bỏ "HLZ1"+version (5 byte đầu), rồi đọc n_tok 32 bit (MSB-first)
+    all_bits = bytes_to_bits_msb(comp[5:])
+    it = iter(all_bits)
+    n_tok = bits_to_u32_msb(''.join(next(it) for _ in range(32)))
+
+    # Thu thập bitstring từng token (để không cắt token)
+    token_bitstrs: List[str] = []
+    for _ in range(n_tok):
+        sym, _base_len, extra_bits, _meta, sym_bits = dec_trie.decode_symbol(it)
+        parts = [sym_bits]
+        if 257 <= sym <= 285:
+            if extra_bits > 0:
+                parts.append(''.join(next(it) for _ in range(extra_bits)))
+            dcode = ''.join(next(it) for _ in range(5))
+            parts.append(dcode)
+            _base, deb = DIST_TABLE[int(dcode, 2)]
+            if deb > 0:
+                parts.append(''.join(next(it) for _ in range(deb)))
+        token_bitstrs.append(''.join(parts))
+
+    CAP_NORM = 507          # payload chunk thường
+    CAP_LAST = 512 - 5 - 9  # 498 payload chunk cuối
+
+    out_bits: List[str] = []      # để kết thành .bin
+    chunk_lines: List[str] = []   # mỗi phần tử là 1 dòng 512 bit cho .mem
+    chunk_logs = []
+
+    chunk_idx = 0
+    cur_payload_bits: List[str] = []
+    cur_used = 0
+    cur_tokens = 0
+
+    def flush_normal():
+        nonlocal out_bits, chunk_lines, cur_payload_bits, cur_used, chunk_idx, cur_tokens
+        if cur_used > CAP_NORM:
+            raise ValueError(f"Chunk payload vượt {CAP_NORM} bit (={cur_used}).")
+        offset = 512 - (5 + cur_used)  # 0..31
+        if not (0 <= offset <= 31):
+            raise ValueError(f"offset ngoài biên 0..31: {offset} (cur_used={cur_used})")
+
+        header = format(offset, '05b')
+        payload = (''.join(cur_payload_bits) + ('0' * CAP_NORM))[:CAP_NORM]
+
+        # Thêm vào bitstream và dòng 512b
+        out_bits.append(header)
+        out_bits.append(payload)
+        chunk_lines.append(header + payload)
+
+        chunk_logs.append((chunk_idx, cur_tokens, cur_used, offset, False))
+        chunk_idx += 1
+        cur_payload_bits.clear()
+        cur_used = 0
+        cur_tokens = 0
+
+    def flush_final():
+        """Chunk cuối: header=11111, + 9b used_bits, + payload 498b padded."""
+        nonlocal out_bits, chunk_lines, cur_payload_bits, cur_used, chunk_idx, cur_tokens
+        if cur_used > CAP_LAST:
+            raise ValueError(
+                f"Chunk cuối used_bits={cur_used} > {CAP_LAST}. "
+                f"Hãy flush chunk thường trước khi đóng final."
+            )
+
+        header = '11111'                  # sentinel = 32
+        used9  = format(cur_used, '09b')
+        payload = (''.join(cur_payload_bits) + ('0' * CAP_LAST))[:CAP_LAST]
+
+        # đưa vào bitstream và 1 dòng 512b
+        out_bits.append(header)
+        out_bits.append(used9)
+        out_bits.append(payload)
+        chunk_lines.append(header + used9 + payload)
+
+        chunk_logs.append((chunk_idx, cur_tokens, cur_used, 32, True))
+        chunk_idx += 1
+        cur_payload_bits.clear()
+        cur_used = 0
+        cur_tokens = 0
+
+    # Packing token vào chunk thường (không cắt token)
+    for tb in token_bitstrs:
+        tb_len = len(tb)
+        if tb_len > CAP_LAST:
+            raise ValueError(
+                f"Một token dài {tb_len} bit > {CAP_LAST} (CAP chunk cuối). "
+                f"Không thể đóng gói mà không cắt token."
+            )
+        if cur_used + tb_len > CAP_NORM:
+            flush_normal()
+        cur_payload_bits.append(tb)
+        cur_used += tb_len
+        cur_tokens += 1
+
+    # Luôn tạo chunk cuối
+    if cur_used == 0:
+        flush_final()
+    else:
+        if cur_used > CAP_LAST:
+            flush_normal()
+            flush_final()
+        else:
+            flush_final()
+
+    # ---------- Ghi file ----------
+    # 1) Nhị phân .bin (nối tất cả chunk)
+    bitstream = ''.join(out_bits)
+    out_bytes = bits_to_bytes_msb(bitstream)
+    bin_path = outdir / f"{stem}.bin"
+    bin_path.write_bytes(out_bytes)
+
+    # 2) Văn bản .mem (mỗi dòng 512 ký tự '0'/'1' cho $readmemb)
+    mem_path = outdir / f"{stem}.mem"
+    with mem_path.open("w", encoding="utf-8") as f:
+        for line in chunk_lines:
+            assert len(line) == 512, f"Line length != 512 (got {len(line)})"
+            f.write(line + "\n")
+
+    # 3) Log kiểm tra
+    meta_path = outdir / f"{stem}.chunks.txt"
+    with meta_path.open("w", encoding="utf-8") as f:
+        f.write("chunk_idx,tokens,used_bits,header,final\n")
+        for idx, toks, used, hdr, is_final in chunk_logs:
+            f.write(f"{idx},{toks},{used},{hdr},{int(is_final)}\n")
+
+    print(f"[tokens-chunked/512+final] wrote:")
+    print(f"  - {bin_path.as_posix()} (binary)")
+    print(f"  - {mem_path.as_posix()} (readmemb lines)")
+    print(f"  - {meta_path.as_posix()} (meta)")
 
 def _emit_tokenbits_512_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tokenbits_512"):
     if comp[:4] != b"HLZ1": raise ValueError("Bad magic: HLZ1")
@@ -337,8 +471,8 @@ def cli_compress(args):
     (outdir/"source.lz").write_bytes(lz_stream)
     print("[compress] Wrote ->", (outdir/'compressed.hlz').as_posix(), f"(tokens={len(tokens)})")
     print("[compress] Saved LZ77 stream ->", (outdir/'source.lz').as_posix())
-    try: _emit_tokens_only(outdir, comp, stem="compressed_tokens")
-    except Exception as e: print("[tokens-only] Bỏ qua do lỗi:", e)
+    try: _emit_tokens_only(outdir, comp, enc_tbl_path, stem="tokens_chunked")
+    except Exception as e: print("[tokens-chunked/512] Bỏ qua do lỗi:", e)
     try: _emit_tokenbits_512_only(outdir, comp, enc_tbl_path, stem="tokenbits_512")
     except Exception as e: print("[tokenbits_512] Bỏ qua do lỗi:", e)
     preview_hlz_codebits_msb("[preview] hlz code_bits (MSB)", comp, enc_tbl_path, n=20)
