@@ -400,19 +400,32 @@ def _emit_tokenbits_512_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str
     payload_bits = (payload_bits_raw + '0' * 512)[:512]
 
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Ghi file .bits
     bits_path = outdir / f"{stem}.bits"
     with bits_path.open("w", encoding="utf-8") as fbits:
         fbits.write(payload_bits)
 
-    # Ghi thêm file .nbits chứa số bit có ý nghĩa
+    # 2) Ghi file .nbits chứa số bit có ý nghĩa
     nbits_path = outdir / f"{stem}.nbits"
     with nbits_path.open("w", encoding="utf-8") as fmeta:
         fmeta.write(str(meaningful_bits) + "\n")
 
+    # 3) Ghi file .hex: 512 bit -> 64 byte -> 128 ký tự hex (MSB-first)
+    #    bits_to_bytes_msb đã tồn tại trong file và pack theo MSB-first.
+    bytes_512 = bits_to_bytes_msb(payload_bits)  # kỳ vọng 64 byte
+    if len(bytes_512) != 64:
+        # Trường hợp hiếm do thay đổi logic, vẫn pad để đảm bảo đủ 64 byte
+        bytes_512 = (bytes_512 + b"\x00" * 64)[:64]
+    hex_path = outdir / f"{stem}.hex"
+    with hex_path.open("w", encoding="utf-8") as fhex:
+        fhex.write(bytes_512.hex() + "\n")      # dùng chữ thường; đổi .upper() nếu muốn
+
     # In ra màn hình
     print(
         f"[tokenbits-512] wrote -> {bits_path.as_posix()} "
-        f"(meaningful_bits={meaningful_bits}, padded={512 - meaningful_bits}, tokens={taken})"
+        f"(meaningful_bits={meaningful_bits}, padded={512 - meaningful_bits}, tokens={taken}); "
+        f"hex -> {hex_path.as_posix()}"
     )
 
 # ===================== Stats & summary =====================
