@@ -362,9 +362,98 @@ def _emit_tokens_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tok
     print(f"  - {bin_path.as_posix()} ")
 
 def _emit_tokenbits_512_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tokenbits_512"):
-    if comp[:4] != b"HLZ1": raise ValueError("Bad magic: HLZ1")
+    """
+    Emit 512-bit token bit-slice in three files:
+      - {stem}.bits    : exact 512 bits (string '0'/'1')
+      - {stem}.nbits   : meaningful bit count before padding
+      - {stem}.hex     : 5 display lines:
+           1) continuous hex (lower)
+           2) continuous hex (UPPER)
+           3) byte-spaced hex "aa bb ..."
+           4) byte-colon hex "AA:BB:..."
+           5) C array "0xAA,0xBB,..."
+    """
+    if comp[:4] != b"HLZ1":
+        raise ValueError("Bad magic: HLZ1")
     dec_trie = LitLenDecodeTrie_MSB(enc_csv)
-    bits = bytes_to_bits_msb(comp[5:]); it = iter(bits)
+    bits = bytes_to_bits_msb(comp[5:])
+    it = iter(bits)
+
+    n_tok = bits_to_u32_msb(''.join(next(it) for _ in range(32)))
+
+    total = 0
+    used_bits_all = []
+    taken = 0
+    while taken < n_tok:
+        sym, base_len, extra_bits, used, used_bits = dec_trie.decode_symbol(it)
+        used_bits_all.append(used_bits)
+        total += len(used_bits)
+
+        if 257 <= sym <= 285:
+            if extra_bits > 0:
+                eb = ''.join(next(it) for _ in range(extra_bits))
+                used_bits_all.append(eb)
+                total += len(eb)
+            dcode = ''.join(next(it) for _ in range(5))
+            used_bits_all.append(dcode)
+            total += 5
+            base, deb = DIST_TABLE[int(dcode, 2)]
+            if deb > 0:
+                dexb = ''.join(next(it) for _ in range(deb))
+                used_bits_all.append(dexb)
+                total += len(dexb)
+
+        if total >= 512:
+            taken += 1
+            break
+        taken += 1
+
+    payload_bits_raw = ''.join(used_bits_all)
+    meaningful_bits = min(len(payload_bits_raw), 512)
+    payload_bits = (payload_bits_raw + '0' * 512)[:512]
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    bits_path = outdir / f"{stem}.bits"
+    with bits_path.open("w", encoding="utf-8") as fbits:
+        fbits.write(payload_bits)
+
+    nbits_path = outdir / f"{stem}.nbits"
+    with nbits_path.open("w", encoding="utf-8") as fmeta:
+        fmeta.write(str(meaningful_bits) + "\n")
+
+    bytes_512 = bits_to_bytes_msb(payload_bits)
+    if len(bytes_512) != 64:
+        bytes_512 = (bytes_512 + b"\x00" * 64)[:64]
+
+    hex_path = outdir / f"{stem}.hex"
+
+    hex_lower = bytes_512.hex()
+    hex_upper = hex_lower.upper()
+
+    def _chunk(s: str, n: int):
+        return [s[i:i+n] for i in range(0, len(s), n)]
+
+    byte_pairs = _chunk(hex_lower, 2)
+
+    line3 = ' '.join(byte_pairs)
+    line4 = ':'.join(bp.upper() for bp in byte_pairs)
+    line5 = ','.join('0x' + bp.upper() for bp in byte_pairs)
+
+    with hex_path.open("w", encoding="utf-8") as fhex:
+        fhex.write(hex_lower + "\n")
+        fhex.write(hex_upper + "\n")
+        fhex.write(line3 + "\n")
+        fhex.write(line4 + "\n")
+        fhex.write(line5 + "\n")
+
+    print(
+        f"[tokenbits-512] wrote -> {bits_path.as_posix()} "
+        f"(meaningful_bits={meaningful_bits}, padded={512 - meaningful_bits}, tokens={taken}); "
+        f"hex(5 lines) -> {hex_path.as_posix()}"
+    )
+
+
 
     n_tok = bits_to_u32_msb(''.join(next(it) for _ in range(32)))
     total = 0; used_bits_all = []; taken = 0
@@ -400,33 +489,236 @@ def _emit_tokenbits_512_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str
     payload_bits = (payload_bits_raw + '0' * 512)[:512]
 
     outdir.mkdir(parents=True, exist_ok=True)
-
-    # 1) Ghi file .bits
     bits_path = outdir / f"{stem}.bits"
     with bits_path.open("w", encoding="utf-8") as fbits:
         fbits.write(payload_bits)
 
-    # 2) Ghi file .nbits chứa số bit có ý nghĩa
+    # Ghi thêm file .nbits chứa số bit có ý nghĩa
     nbits_path = outdir / f"{stem}.nbits"
     with nbits_path.open("w", encoding="utf-8") as fmeta:
         fmeta.write(str(meaningful_bits) + "\n")
 
-    # 3) Ghi file .hex: 512 bit -> 64 byte -> 128 ký tự hex (MSB-first)
-    #    bits_to_bytes_msb đã tồn tại trong file và pack theo MSB-first.
-    bytes_512 = bits_to_bytes_msb(payload_bits)  # kỳ vọng 64 byte
-    if len(bytes_512) != 64:
-        # Trường hợp hiếm do thay đổi logic, vẫn pad để đảm bảo đủ 64 byte
-        bytes_512 = (bytes_512 + b"\x00" * 64)[:64]
-    hex_path = outdir / f"{stem}.hex"
-    with hex_path.open("w", encoding="utf-8") as fhex:
-        fhex.write(bytes_512.hex() + "\n")      # dùng chữ thường; đổi .upper() nếu muốn
-
     # In ra màn hình
     print(
         f"[tokenbits-512] wrote -> {bits_path.as_posix()} "
-        f"(meaningful_bits={meaningful_bits}, padded={512 - meaningful_bits}, tokens={taken}); "
-        f"hex -> {hex_path.as_posix()}"
+        f"(meaningful_bits={meaningful_bits}, padded={512 - meaningful_bits}, tokens={taken})"
     )
+
+def _verify_tokens_chunked_mem_nocmp(outdir: Path, enc_csv: Path, raw_input_path: Path | None = None):
+    """
+    Verify tokens_chunked.mem WITHOUT reading compressed.hlz.
+    Uses tokens_chunked.meta.json (contains n_tok) and tokens_chunked.mem to reconstruct HLZ1 v4.
+    Produces:
+      - recon_from_mem_nocmp.hlz
+      - recon_from_mem_nocmp.lz
+      - (optional) recon_from_mem_nocmp.raw
+      - verify_from_mem.txt
+    """
+    import json
+
+    mem_path = outdir / "tokens_chunked.mem"
+    meta_path = outdir / "tokens_chunked.meta.json"
+    src_lz_path = outdir / "source.lz"
+
+    if not mem_path.exists():
+        raise FileNotFoundError(f"Missing {mem_path.as_posix()} (run compress first)")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Missing {meta_path.as_posix()} (cannot infer n_tok)")
+    if not src_lz_path.exists():
+        raise FileNotFoundError(f"Missing {src_lz_path.as_posix()} (for .lz comparison)")
+
+    # Read n_tok
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        n_tok = int(meta.get("n_tok"))
+        if n_tok < 0:
+            raise ValueError("n_tok < 0")
+    except Exception as e:
+        raise ValueError(f"Failed reading n_tok from {meta_path.name}: {e}")
+
+    # Read bitstream from .mem
+    bitstream = ''.join(line.strip() for line in mem_path.read_text(encoding="utf-8").splitlines())
+    N = len(bitstream); idx = 0
+
+    def _need(nbits: int):
+        nonlocal idx, N
+        if idx + nbits > N:
+            raise ValueError(f"Bitstream underflow: need {nbits} @ {idx}/{N}")
+
+    def _read(nbits: int) -> str:
+        nonlocal idx
+        _need(nbits)
+        s = bitstream[idx:idx+nbits]
+        idx += nbits
+        return s
+
+    # Parse chunks to recover token payload bits
+    payload_bits_parts = []
+    while True:
+        hdr = _read(5)
+        if hdr != '11111':
+            offset = int(hdr, 2)
+            used = 507 - offset
+            if not (0 <= used <= 507):
+                raise ValueError(f"Bad header: offset={offset} => used={used}")
+            payload_bits_parts.append(_read(used))
+        else:
+            used9 = int(_read(9), 2)
+            if not (0 <= used9 <= 498):
+                raise ValueError(f"Bad final used_bits: {used9}")
+            payload_bits_parts.append(_read(used9))
+            break
+
+    token_payload_bits = ''.join(payload_bits_parts)
+
+    # Rebuild HLZ1 v4 from n_tok + token_payload_bits (MSB-first)
+    rebuilt_payload_bits = u32_to_bits_msb(n_tok) + token_payload_bits
+    rebuilt_payload_bytes = bits_to_bytes_msb(rebuilt_payload_bits)
+    recon_hlz = b"HLZ1" + bytes([4]) + rebuilt_payload_bytes
+
+    # Decode -> tokens -> .lz
+    dec_trie = LitLenDecodeTrie_MSB(enc_csv)
+    tokens = decode_with_trie_msb(recon_hlz, dec_trie)
+    lz_stream = tokens_to_lz_stream(tokens)
+
+    # Write outputs
+    (outdir / "recon_from_mem_nocmp.hlz").write_bytes(recon_hlz)
+    (outdir / "recon_from_mem_nocmp.lz").write_bytes(lz_stream)
+
+    # Compare with source.lz
+    src_lz = src_lz_path.read_bytes()
+    same_lz = (lz_stream == src_lz)
+
+    # Optional: compare to raw
+    same_raw = None
+    try:
+        if raw_input_path and raw_input_path.exists() and hasattr(_lz77, "lz77_decompress"):
+            raw_recon = _lz77.lz77_decompress(lz_stream)
+            (outdir / "recon_from_mem_nocmp.raw").write_bytes(raw_recon)
+            raw_bytes = raw_input_path.read_bytes()
+            same_raw = (raw_recon == raw_bytes)
+    except Exception as e:
+        print("[verify/mem-nocmp] Skip raw compare due to error:", e)
+
+    # Report
+    report_lines = []
+    report_lines.append("verify_from_mem (no compressed.hlz):")
+    report_lines.append(f"  n_tok(meta): {n_tok}")
+    report_lines.append(f"  bitstream(mem) length: {len(bitstream)}")
+    report_lines.append(f"  payload_bits length: {len(token_payload_bits)}")
+    report_lines.append(f"  .lz equals source.lz? {same_lz}")
+    if same_raw is not None:
+        report_lines.append(f"  raw equals input? {same_raw}")
+    (outdir / "verify_from_mem.txt").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    if same_lz and (same_raw is True or same_raw is None):
+        print("[verify/mem-nocmp] OK: recon_from_mem_nocmp.lz == source.lz", end="")
+        if same_raw is True:
+            print(" and matches input.raw 100%")
+        else:
+            print(" (raw not checked or no lz77_decompress)")
+    else:
+        print("[verify/mem-nocmp] NG: see verify_from_mem.txt for details")
+
+
+def _emit_payload_hex_lines(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "payload_lines"):
+    """
+    Write HEX lines of compressed token payload, với **mỗi dòng chứa các token nguyên vẹn**:
+
+      - 512 bit đầu là payload gồm các bit **đúng như trong luồng nén** (theo thứ tự đọc từ compressed.hlz).
+        * No token is split across lines.
+        * Pad with trailing '0' to exactly 512 bits.
+      - Next 9 bits: meaningful payload bit count before padding (0..512) for this line.
+      - Final 7 bits: "is last line" flag (0000001 for last, 0000000 otherwise).
+
+    Mỗi dòng có (512 + 9 + 7) = 528 bit = 66 byte. Ghi 1 dòng hex chữ thường cho mỗi dòng payload.
+    Output file: {stem}.hex (each row is 132 hex chars).
+    """
+    if comp[:4] != b"HLZ1":
+        raise ValueError("Bad magic: HLZ1")
+
+    # Build token bitstrings exactly like _emit_tokens_only
+    dec_trie = LitLenDecodeTrie_MSB(Path(enc_csv))
+    all_bits = bytes_to_bits_msb(comp[5:])
+    it = iter(all_bits)
+    n_tok = bits_to_u32_msb(''.join(next(it) for _ in range(32)))
+
+    token_bitstrs: List[str] = []
+    for _ in range(n_tok):
+        sym, _base_len, extra_bits, _meta, sym_bits = dec_trie.decode_symbol(it)
+        parts = [sym_bits]
+        if 257 <= sym <= 285:
+            if extra_bits > 0:
+                parts.append(''.join(next(it) for _ in range(extra_bits)))
+            dcode = ''.join(next(it) for _ in range(5))
+            parts.append(dcode)
+            _base, deb = DIST_TABLE[int(dcode, 2)]
+            if deb > 0:
+                parts.append(''.join(next(it) for _ in range(deb)))
+        token_bitstrs.append(''.join(parts))
+
+    # Đóng gói: 512-bit payload (không cắt token), tiếp theo 9-bit used, cuối cùng 7-bit last flag.
+    LINES: List[bytes] = []  # each is 66 bytes
+    CAP = 512
+
+    cur_bits: list[str] = []
+    cur_used = 0
+
+    def _flush(is_last: bool):
+        nonlocal cur_bits, cur_used
+        # Payload padded to 512
+        payload = ''.join(cur_bits)
+        used9 = format(cur_used, '09b')
+        last7 = '0000001' if is_last else '0000000'
+        payload_padded = (payload + ('0' * CAP))[:CAP]
+        line_bits = payload_padded + used9 + last7  # 528 bits
+        line_bytes = bits_to_bytes_msb(line_bits)
+        # safety
+        if len(line_bytes) != 66:
+            line_bytes = (line_bytes + b'\x00' * 66)[:66]
+        LINES.append(line_bytes)
+        cur_bits = []
+        cur_used = 0
+
+    for idx, tb in enumerate(token_bitstrs):
+        bl = len(tb)
+        if bl > CAP:
+            raise ValueError(f"Single token {bl}b exceeds 512-bit payload capacity.")
+        if cur_used + bl > CAP:
+            _flush(False)
+        cur_bits.append(tb)
+        cur_used += bl
+
+    # final line (even if empty)
+    _flush(True)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_path = outdir / f"{stem}.hex"
+    
+    # Also write a reference CSV to inspect each line
+    csv_path = outdir / f"{stem}.csv"
+    with csv_path.open("w", encoding="utf-8") as cf:
+        cf.write("line_index,used_bits,is_last,payload_512b_hex,used9_bin,last7_bin,line_528b_hex\n")
+        for i, row in enumerate(LINES):
+            # Reconstruct fields for CSV:
+            # Split row back into fields for clarity
+            line_bits = bytes_to_bits_msb(row)
+            payload_512 = line_bits[:512]
+            used9 = line_bits[512:521]
+            last7 = line_bits[521:528]
+            payload_hex = bits_to_bytes_msb(payload_512).hex()
+            cf.write(f"{i},{int(used9,2)},{1 if last7=='0000001' else 0},{payload_hex},{used9},{last7},{row.hex()}\n")
+
+    with out_path.open("w", encoding="utf-8") as f:
+        for row in LINES:
+            f.write(row.hex() + "\n")
+
+    # small sidecar (optional)
+    meta_path = outdir / f"{stem}.meta.txt"
+    with meta_path.open("w", encoding="utf-8") as fm:
+        fm.write(f"lines={len(LINES)}  (each 528 bits = 66 bytes = 132 hex chars)\n")
+
+    print(f"[payload-hex-lines] wrote -> {out_path.as_posix()} (lines={len(LINES)})")
 
 # ===================== Stats & summary =====================
 def _print_stats(raw_bytes: int, lz_bytes: int, hlz_bytes: int, prefix="[stats]"):
@@ -471,6 +763,24 @@ def cli_compress(args):
     except Exception as e: print("[tokens-chunked/512] Bỏ qua do lỗi:", e)
     try: _emit_tokenbits_512_only(outdir, comp, enc_tbl_path, stem="tokenbits_512")
     except Exception as e: print("[tokenbits_512] Bỏ qua do lỗi:", e)
+    # NEW: verify using tokens_chunked.mem + meta (no compressed.hlz)
+    try:
+        _verify_tokens_chunked_mem_nocmp(outdir, enc_tbl_path, raw_input_path=raw_path)
+    except Exception as e:
+        print("[verify/mem-nocmp] Verification error:", e)
+    # NEW: payload HEX lines (512b payload + 9b used + 7b last)
+    try:
+        _emit_payload_hex_lines(outdir, comp, enc_tbl_path, stem="payload_lines")
+    except Exception as e:
+        print("[payload-hex-lines] Bỏ qua do lỗi:", e)
+    # NEW(meta): write metadata for tokens_chunked (no dependency on compressed.hlz)
+    try:
+        import json as _json_for_meta
+        _meta_obj = {"n_tok": int(len(tokens)), "format_version": 4}
+        (outdir / "tokens_chunked.meta.json").write_text(_json_for_meta.dumps(_meta_obj) + "\n", encoding="utf-8")
+        print("[meta] Wrote ->", (outdir/"tokens_chunked.meta.json").as_posix(), _meta_obj)
+    except Exception as e:
+        print("[meta] Failed to write tokens_chunked.meta.json:", e)
     preview_hlz_codebits_msb("[preview] hlz code_bits (MSB)", comp, enc_tbl_path, n=20)
     _print_stats(len(raw), len(lz_stream), len(comp))
     _write_summary(Path(args.outdir), {
@@ -617,5 +927,3 @@ def main():
     args = apply_config_to_args(args)
     args.func(args)
 if __name__=="__main__": main()
-
-
