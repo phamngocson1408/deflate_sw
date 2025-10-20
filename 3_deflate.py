@@ -1,3 +1,4 @@
+from typing import List, Tuple, Dict
 
 import configparser
 
@@ -233,133 +234,202 @@ def preview_hlz_codebits_msb(label: str, comp: bytes, enc_csv: Path, n: int = 20
         print(f"{i:02d}: {bstr}  — {desc}")
 
 # ===================== Tokens-only / Tokenbits-512 =====================
+
 def _emit_tokens_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tokens_chunked"):
     """
-    Stream biến độ dài:
-      - Chunk thường: 5b header = offset(0..31), + payload đúng 'used_bits = 507-offset' (không đệm).
-      - Chunk cuối:   5b header = 11111, + 9b used_bits, + payload đúng used_bits (không đệm).
-    Ghi ra:
-      - <stem>.bin  : nhị phân bitstream nối sát các chunk (không đệm giữa chunk)
-      - <stem>.mem  : mỗi dòng 512 bit (cắt từ bitstream; dòng cuối pad 0 cho đủ 512)
-      - <stem>.chunks.txt: log (mỗi hàng một chunk)
+    Tạo tokens_chunked.mem theo yêu cầu mới:
+      - Chunk = 4096 bytes uncompressed.
+      - Với mỗi chunk: dùng phương pháp nén như hiện tại (decode tokens từ comp -> dùng chính bit của token).
+      - Chia chunk thành các transfer 512-bit:
+          + Normal transfer: 5b header = offset(0..31), + payload có đúng 'used_bits = 507 - offset' (KHÔNG đệm).
+            (Các normal transfer sẽ được NỐI liên tục rồi mới cắt thành các dòng 512 bit khi ghi file .mem.)
+          + Final transfer: 5b header = 11111, + payload còn lại + EOB(256) + pad 0 cho đủ 512 bit.
+      - Chỉ ghi 20 chunk đầu tiên.
+      - Ghi thêm file tokens_chunked.log.csv với thống kê theo chunk.
     """
     if comp[:4] != b"HLZ1":
         raise ValueError("Bad magic: HLZ1")
 
     outdir.mkdir(parents=True, exist_ok=True)
-    dec_trie = LitLenDecodeTrie_MSB(Path(enc_csv))
 
-    # Bỏ "HLZ1"+version (5 byte đầu), rồi đọc n_tok 32 bit (MSB-first)
+    # Trie decode cho lit/len và encode table để lấy EOB bits
+    dec_trie = LitLenDecodeTrie_MSB(Path(enc_csv))
+    enc_tbl  = LitLenEncodeTableCSV_MSB(Path(enc_csv))
+
+    # Đọc toàn bộ bit sau header "HLZ1"+version (5 bytes), n_tok 32 bit
     all_bits = bytes_to_bits_msb(comp[5:])
     it = iter(all_bits)
     n_tok = bits_to_u32_msb(''.join(next(it) for _ in range(32)))
 
-    # Thu thập bitstring từng token để không cắt token
+    # Thu thập bitstring của từng token + số byte uncompressed do token tạo ra
     token_bitstrs: List[str] = []
+    token_uncomp:  List[int] = []  # LIT=1, MATCH=L
     for _ in range(n_tok):
-        sym, _base_len, extra_bits, _meta, sym_bits = dec_trie.decode_symbol(it)
+        sym, base_len, extra_bits, _meta, sym_bits = dec_trie.decode_symbol(it)
         parts = [sym_bits]
-        if 257 <= sym <= 285:
-            if extra_bits > 0:
-                parts.append(''.join(next(it) for _ in range(extra_bits)))
+        if 0 <= sym <= 255:
+            # literal
+            token_bitstrs.append(''.join(parts))
+            token_uncomp.append(1)
+        elif sym == 256:
+            # EOB trong gói tổng thể: bỏ qua để tự chèn cho mỗi chunk
+            # (không thêm vào token_bitstrs / token_uncomp)
+            continue
+        elif 257 <= sym <= 285:
+            # len extra
+            eb = ''.join(next(it) for _ in range(extra_bits)) if extra_bits > 0 else ""
+            parts.append(eb)
+            # distance code + extra
             dcode = ''.join(next(it) for _ in range(5))
             parts.append(dcode)
             _base, deb = DIST_TABLE[int(dcode, 2)]
-            if deb > 0:
-                parts.append(''.join(next(it) for _ in range(deb)))
-        token_bitstrs.append(''.join(parts))
-
-    # Packing theo chunk "logical" như trước (không cắt token)
-    CAP_NORM = 507
-    CAP_LAST = 498
-
-    chunks = []  # mỗi phần tử: dict {final, used_bits, payload_bits(str)}
-    cur_bits = []
-    cur_used = 0
-
-    def close_normal():
-        nonlocal cur_bits, cur_used
-        # offset = 507 - used
-        offset = 507 - cur_used
-        assert 0 <= offset <= 31
-        header = format(offset, '05b')
-        payload = ''.join(cur_bits)  # đúng = cur_used
-        chunks.append({"final": False, "used_bits": cur_used, "header": header, "payload": payload})
-        cur_bits = []
-        cur_used = 0
-
-    def close_final():
-        nonlocal cur_bits, cur_used
-        header = '11111'
-        used9 = format(cur_used, '09b')
-        payload = ''.join(cur_bits)
-        chunks.append({"final": True, "used_bits": cur_used, "header": header, "used9": used9, "payload": payload})
-        cur_bits = []
-        cur_used = 0
-
-    for tb in token_bitstrs:
-        bl = len(tb)
-        if bl > CAP_LAST:
-            raise ValueError(
-                f"Token {bl}b > {CAP_LAST}b (không thể đóng gói mà không cắt)."
-            )
-        if cur_used + bl > CAP_NORM:
-            close_normal()
-        cur_bits.append(tb)
-        cur_used += bl
-
-    # Đóng bằng chunk cuối
-    if cur_used == 0:
-        close_final()
-    elif cur_used <= CAP_LAST:
-        close_final()
-    else:
-        close_normal()
-        close_final()  # final rỗng (used_bits = 0)
-
-    # Kết thành bitstream *không đệm giữa chunk*
-    bitstream_parts = []
-    chunk_logs = []
-    for i, ch in enumerate(chunks):
-        if not ch["final"]:
-            # 5 + used_bits
-            bitstream_parts.append(ch["header"])
-            bitstream_parts.append(ch["payload"])
-            chunk_logs.append((i, 0, ch["used_bits"], int(ch["header"], 2), 0))
+            dexb = ''.join(next(it) for _ in range(deb)) if deb > 0 else ""
+            if dexb:
+                parts.append(dexb)
+            token_bitstrs.append(''.join(parts))
+            L = base_len + (int(eb, 2) if eb else 0)
+            token_uncomp.append(L)
         else:
-            # 5 + 9 + used_bits
-            bitstream_parts.append(ch["header"])  # 11111
-            bitstream_parts.append(ch["used9"])
-            bitstream_parts.append(ch["payload"])
-            chunk_logs.append((i, 1, ch["used_bits"], 32, 1))
-    bitstream = ''.join(bitstream_parts)
+            raise ValueError(f"Symbol không hợp lệ: {sym}")
 
-    # 1) Ghi .bin
-    out_bytes = bits_to_bytes_msb(bitstream)
-    bin_path = outdir / f"{stem}.bin"
-    bin_path.write_bytes(out_bytes)
+    # Hằng số đóng gói
+    CHUNK_UC_BYTES = 4096
+    CAP_NORM = 507                  # payload cap sau 5b header
+    MIN_USED = 507 - 31             # để offset ∈ [0..31]
+    EOB_BITS = enc_tbl.enc_map[256] # MSB-first
 
-    # 2) Ghi .mem: cắt dòng 512 bit từ bitstream, dòng cuối pad 0
-    mem_lines = []
-    for i in range(0, len(bitstream), 512):
-        line = bitstream[i:i+512]
-        if len(line) < 512:
-            line = line + '0' * (512 - len(line))
-        mem_lines.append(line)
+    # Gom token theo uncompressed 4096B
+    chunks_tokbits: List[List[str]] = []
+    chunks_ucbytes: List[int] = []
+    chunks_tokcnt:  List[int] = []
+
+    cur_bits_list: List[str] = []
+    cur_uc = 0
+    cur_tokcnt = 0
+
+    for tb, uc in zip(token_bitstrs, token_uncomp):
+        if cur_uc + uc > CHUNK_UC_BYTES and cur_uc > 0:
+            # chốt chunk hiện tại
+            chunks_tokbits.append(cur_bits_list)
+            chunks_ucbytes.append(cur_uc)
+            chunks_tokcnt.append(cur_tokcnt)
+            # reset
+            cur_bits_list = []
+            cur_uc = 0
+            cur_tokcnt = 0
+        # add token vào chunk đang mở
+        cur_bits_list.append(tb)
+        cur_uc += uc
+        cur_tokcnt += 1
+
+    # chốt chunk cuối cùng nếu có
+    if cur_tokcnt > 0:
+        chunks_tokbits.append(cur_bits_list)
+        chunks_ucbytes.append(cur_uc)
+        chunks_tokcnt.append(cur_tokcnt)
+
+    total_chunks = len(chunks_tokbits)
+    write_chunks = min(total_chunks, 20)
+
+    # Đóng gói thành các transfers (bitstring, KHÔNG pad normal-transfer)
+    def build_transfers_for_chunk(tokbits: List[str]) -> Tuple[List[str], Dict[str, int]]:
+        normal_transfers: List[str] = []
+        remain_bits = []  # phần payload chưa flush -> sẽ vào final cùng EOB
+        used = 0
+        n_normal = 0
+        total_payload_before_eob = 0
+
+        def flush_normal():
+            nonlocal remain_bits, used, n_normal, total_payload_before_eob
+            if used == 0:
+                return
+            if used < MIN_USED:
+                # Không đủ để tạo 1 normal-transfer hợp lệ (offset <=31),
+                # giữ lại để dồn vào final.
+                return
+            offset = 507 - used
+            header = format(offset, '05b')
+            payload = ''.join(remain_bits)  # đúng = used bits
+            normal_transfers.append(header + payload)  # KHÔNG pad, nối thẳng
+            total_payload_before_eob += used
+            n_normal += 1
+            remain_bits = []
+            used = 0
+
+        for tb in tokbits:
+            bl = len(tb)
+            if bl > CAP_NORM:
+                raise ValueError(f"Token {bl}b > 507b: không thể đóng gói transfer.")
+            if used + bl > CAP_NORM:
+                # nếu đang có đủ để flush normal
+                if used >= MIN_USED:
+                    flush_normal()
+                # thêm token
+                remain_bits.append(tb)
+                used += bl
+                if used > CAP_NORM:
+                    raise ValueError("Vượt CAP_NORM sau khi thêm token.")
+            else:
+                remain_bits.append(tb)
+                used += bl
+
+        # Final transfer: header=11111 + remain + EOB
+        header_final = '11111'
+        final_payload = ''.join(remain_bits) + EOB_BITS
+        total_payload_before_eob += used
+
+        # Tổng bit từ các normal transfers
+        sum_normals_bits = sum(len(s) for s in normal_transfers)
+
+        # Bit trước pad của final (tạm thời)
+        final_bits_no_pad = header_final + final_payload
+
+        # Pad sao cho (sum_normals_bits + len(final_bits)) % 512 == 0
+        rem = (sum_normals_bits + len(final_bits_no_pad)) % 512
+        pad_len = (512 - rem) % 512
+        final_bits = final_bits_no_pad + '0' * pad_len
+
+        transfers = normal_transfers + [final_bits]
+        stats = {
+            "normal_transfers": n_normal,
+            "final_total_bits": len(final_bits),
+            "final_payload_bits_before_pad": used,
+            "total_payload_bits_before_eob": total_payload_before_eob,
+            "pad_bits_in_final": pad_len,
+        }
+        return transfers, stats
+
+    # Viết .mem: nối TẤT CẢ transfers của từng chunk thành bitstream rồi cắt 512b/line
     mem_path = outdir / f"{stem}.mem"
-    with mem_path.open("w", encoding="utf-8") as f:
-        for line in mem_lines:
-            f.write(line + "\n")
+    csv_path = outdir / f"{stem}.log.csv"
+    with mem_path.open("w", encoding="utf-8") as fmem, csv_path.open("w", encoding="utf-8", newline="") as flog:
+        w = csv.writer(flog)
+        w.writerow(["chunk_idx","uc_bytes","tokens",
+                    "num_transfers","normal_transfers",
+                    "final_bits","final_payload_bits_before_pad",
+                    "total_payload_bits_before_eob","final_pad_bits",
+                    "lines_written"])
+        total_lines = 0
+        for cidx in range(write_chunks):
+            transfers, st = build_transfers_for_chunk(chunks_tokbits[cidx])
+            # Nối các transfer rồi cắt 512b/line
+            bitstream = ''.join(transfers)
+            # đảm bảo độ dài là bội số của 512 (do final đã pad cho chunk)
+            if len(bitstream) % 512 != 0:
+                # điều này không nên xảy ra
+                raise AssertionError("Chunk bitstream không chia hết 512 mặc dù final đã pad.")
+            nlines_before = total_lines
+            for i in range(0, len(bitstream), 512):
+                fmem.write(bitstream[i:i+512] + "\n")
+                total_lines += 1
+            w.writerow([cidx, chunks_ucbytes[cidx], chunks_tokcnt[cidx],
+                        len(transfers), st["normal_transfers"],
+                        st["final_total_bits"], st["final_payload_bits_before_pad"],
+                        st["total_payload_bits_before_eob"], st["pad_bits_in_final"],
+                        total_lines - nlines_before])
 
-    # 3) Log
-    meta_path = outdir / f"{stem}.chunks.txt"
-    with meta_path.open("w", encoding="utf-8") as f:
-        f.write("chunk_idx,is_final,used_bits,header_value,is_final_flag\n")
-        for idx, is_final, used, hdr, fin in chunk_logs:
-            f.write(f"{idx},{is_final},{used},{hdr},{fin}\n")
-
-    print(f"[stream/variable] wrote:")
-    print(f"  - {bin_path.as_posix()} ")
+    print(f"[tokens-chunked] wrote -> {mem_path.as_posix()} (chunks_written={write_chunks}/{total_chunks})")
+    print(f"[tokens-chunked] log    -> {csv_path.as_posix()}")
 
 def _emit_tokenbits_512_only(outdir: Path, comp: bytes, enc_csv: Path, stem: str = "tokenbits_512"):
     """
